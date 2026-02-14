@@ -1,5 +1,6 @@
 import joblib
 import numpy as np
+import pandas as pd
 
 class RoleClassifier:
     def __init__(self):
@@ -8,8 +9,9 @@ class RoleClassifier:
         )
 
     def classify(self, features):
-        X = np.array([[features["body_height"],
-                       features["shoulder_body_ratio"]]])
+        # Use pandas DataFrame with feature names to avoid sklearn warning
+        X = pd.DataFrame([[features["body_height"], features["shoulder_body_ratio"]]], 
+                        columns=["body_height", "shoulder_body_ratio"])
 
         prob = self.model.predict_proba(X)[0]
         label = self.model.predict(X)[0]

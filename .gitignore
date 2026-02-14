@@ -23,13 +23,17 @@ ENV/
 **/google-services.json
 firebase-adminsdk*.json
 
-# Model files (optional - uncomment if too large)
-# *.pt
-# *.pth
+# Model files (TOO LARGE for GitHub - download separately)
+*.pt
+*.pth
+*.onnx
+*.tflite
+classifiers/trained_model/*.pkl
 
 # Data
 data/raw/*
 !data/raw/.gitkeep
+data/features/*.csv
 
 # OS
 .DS_Store

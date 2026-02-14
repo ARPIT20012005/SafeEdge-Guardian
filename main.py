@@ -2,6 +2,14 @@ import argparse
 import sys
 import cv2
 import time
+from collections import defaultdict
+
+# Platform-specific audio support
+try:
+    import winsound
+    HAS_WINSOUND = True
+except ImportError:
+    HAS_WINSOUND = False
 
 from detectors.yolo_person_detector import YOLOPersonDetector
 from features.feature_extractor import FeatureExtractor
@@ -20,7 +28,7 @@ def parse_args():
 	parser.add_argument(
 		"--source",
 		type=str,
-		default="http://172.18.132.254:8080",
+		default="0",
 		help="Video source: camera index (e.g., 0), video path, or streaming URL",
 	)
 	parser.add_argument(
@@ -65,9 +73,10 @@ def center_of_bbox(bbox):
 	return int((x1 + x2) / 2), int((y1 + y2) / 2)
 
 
-def draw_person(frame, bbox, role, prob, color, extra_note=None):
+def draw_person(frame, bbox, role, prob, color, extra_note=None, flash=False):
 	x1, y1, x2, y2 = bbox
-	cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+	thickness = 4 if flash else 2
+	cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
 	label = f"{role} {prob:.2f}"
 	if extra_note:
 		label = f"{label} | {extra_note}"
@@ -80,6 +89,22 @@ def draw_person(frame, bbox, role, prob, color, extra_note=None):
 		color,
 		2,
 	)
+
+
+def trigger_alert(alert_type="danger"):
+	"""Trigger audio alert (Windows only)"""
+	if not HAS_WINSOUND:
+		return  # Silent on non-Windows platforms (Raspberry Pi, etc.)
+	
+	try:
+		if alert_type == "danger":
+			# High-pitched beep for danger (frequency, duration in ms)
+			winsound.Beep(2000, 300)
+		elif alert_type == "warning":
+			# Medium-pitched beep for warning
+			winsound.Beep(1000, 200)
+	except Exception as e:
+		pass  # Silent fail if audio not available
 
 
 def main():
@@ -100,30 +125,58 @@ def main():
 	print(f"Connecting to video source: {src}")
 	print(f"Target resolution: {res_width}x{res_height}")
 	print(f"Target FPS: {args.target_fps}")
-	cap = ThreadedCamera(src, buffer_size=1, timeout=5, 
+	
+	# Use longer timeout for network streams
+	timeout = 30 if isinstance(src, str) and src.startswith('http') else 10
+	print(f"Using timeout: {timeout} seconds")
+	
+	cap = ThreadedCamera(src, buffer_size=1, timeout=timeout, 
 	                     target_width=res_width, target_height=res_height).start()
 	
 	# Give the thread time to start and grab first frame
-	time.sleep(2)
+	print("Waiting for camera to initialize...")
+	time.sleep(3)
 	
 	if not cap.isOpened():
-		print("Failed to open stream")
+		print("❌ ERROR: Failed to open video stream!")
+		print(f"   Source: {src}")
+		if isinstance(src, str) and src.startswith('http'):
+			print("   Troubleshooting tips for IP camera:")
+			print("   1. Check if the IP address is correct and reachable")
+			print("   2. Verify the camera app is running (e.g., IP Webcam)")
+			print("   3. Try accessing the stream URL in a web browser first")
+			print(f"   4. Try: {src}/video")
+		else:
+			print("   Troubleshooting tips for local camera:")
+			print("   1. Check if camera is connected and not in use by another program")
+			print("   2. Try running: python test_camera_simple.py")
+			print("   3. Check camera permissions in Windows Settings")
 		sys.exit(1)
+	
+	print("✅ Camera connected successfully!")
 
+	print("✅ Camera connected successfully!")
 	print("Stream opened successfully - using threaded capture for stable FPS")
 	print(f"Processing detection every {args.skip_frames} frames")
 
+	print("\n🔄 Loading AI models...")
 	detector = YOLOPersonDetector(conf_thresh=args.confidence)
 	extractor = FeatureExtractor()
 	classifier = RoleClassifier()
 	supervisor = SupervisionChecker()
 	logger = DatasetLogger() if args.log_dataset else None
 	firebase = FirebaseUploader()
+	print("✅ All models loaded!")
 	
 	# Track status changes and frame counter
 	prev_status = None
 	frame_counter = 0
 	upload_interval = 30  # Upload every 30 frames
+	
+	# Child tracking for line crossing detection
+	child_zone_status = defaultdict(lambda: False)  # Track if child was in zone
+	alert_cooldown = {}  # Track last alert time per child
+	ALERT_COOLDOWN_SECONDS = 3  # Minimum seconds between alerts for same child
 	
 	# Performance optimization: skip frames for detection
 	process_every_n_frames = args.skip_frames  # Process detection every Nth frame
@@ -140,6 +193,10 @@ def main():
 	last_valid_frame = None
 	frame_timeout_counter = 0
 	
+	# Stream health monitoring
+	last_health_check = time.time()
+	health_check_interval = 30  # Check stream health every 30 seconds
+	
 	# Cache last detection results
 	last_persons = []
 	last_children = []
@@ -149,10 +206,16 @@ def main():
 	# Get first frame to determine dimensions
 	danger_zone = None
 
+	print("\n🚀 Starting SafeEdge Guardian surveillance...")
 	print("PHASE 7: ADULT SUPERVISION ACTIVE")
 	print("Firebase Integration: Enabled")
-	print("Press 'q' to quit")
+	if not args.no_display:
+		print("📹 Video window will open shortly - Press 'q' to quit")
+	else:
+		print("Running in headless mode (no display)")
+	print("-" * 50)
 
+	frame_received = False
 	while True:
 		# Maintain consistent frame timing
 		current_time = time.time()
@@ -173,16 +236,31 @@ def main():
 				# Reuse last frame for up to 10 seconds
 				frame = last_valid_frame.copy()
 			else:
-				print("Stream lost - no frames available")
+				if not frame_received:
+					print("❌ ERROR: No frames received from camera!")
+					print("   The stream may be unavailable or the wrong URL/device.")
+				else:
+					print("Stream lost - no frames available")
 				break
 		else:
 			# Got a valid frame
+			if not frame_received:
+				print("✅ First frame received! Processing...")
+				frame_received = True
 			last_valid_frame = frame.copy()
 			frame_timeout_counter = 0
 
 		# Skip invalid frames
 		if frame is None or frame.size == 0:
 			continue
+		
+		# Periodic stream health check
+		current_time_check = time.time()
+		if current_time_check - last_health_check > health_check_interval:
+			health = cap.get_stream_health()
+			if not health["is_healthy"]:
+				print(f"⚠️ Stream health warning: {health['seconds_since_frame']:.1f}s since last frame")
+			last_health_check = current_time_check
 
 		# Initialize danger zone on first frame
 		h, w = frame.shape[:2]
@@ -240,15 +318,38 @@ def main():
 			if role == "ADULT":
 				adults.append((p["id"], (cx, cy)))
 				draw_person(frame, bbox, role, prob, (0, 165, 255))
-			else:
+			else:  # CHILD
 				children.append((p["id"], (cx, cy)))
 				in_zone = danger_zone.is_inside(cx, cy)
-				note = "IN-ZONE" if in_zone else None
-				color = (255, 215, 0) if in_zone else (0, 255, 0)
-				draw_person(frame, bbox, role, prob, color, note)
+				
+				# Detect line crossing (child entering danger zone)
+				child_id = p["id"]
+				was_in_zone = child_zone_status[child_id]
+				
+				# Check if this is a new crossing event
+				if in_zone and not was_in_zone:
+					# Child just crossed INTO danger zone!
+					current_time = time.time()
+					last_alert_time = alert_cooldown.get(child_id, 0)
+					
+					if current_time - last_alert_time > ALERT_COOLDOWN_SECONDS:
+						print(f"⚠️ ALERT: Child ID {child_id} crossed into DANGER ZONE!")
+						trigger_alert("danger")
+						firebase.send_alert(child_id, "danger_zone_entry", current_time)
+						alert_cooldown[child_id] = current_time
+				
+				# Update tracking status
+				child_zone_status[child_id] = in_zone
+				
+				note = "⚠️ DANGER" if in_zone else None
+				color = (0, 0, 255) if in_zone else (0, 255, 0)  # Red if in zone
+				flash = in_zone  # Flash border if in danger zone
+				draw_person(frame, bbox, role, prob, color, note, flash)
 
 		# Evaluate supervision relative to children
 		global_status = "safe"
+		children_in_danger = []
+		
 		for cid, cpos in children:
 			in_zone = danger_zone.is_inside(*cpos)
 			if not in_zone:
@@ -273,18 +374,20 @@ def main():
 			if not attentive:
 				if nearest_adult is None:
 					global_status = "danger"
+					children_in_danger.append(cid)
 				else:
-					global_status = "warning"
+					if global_status != "danger":  # Only set warning if not already danger
+						global_status = "warning"
 				# Break early if danger detected
 				if global_status == "danger":
 					break
 			# If attentive, child is supervised - keep status safe unless already escalated
-		
+	
 		# Cache status for next frames
 		last_global_status = global_status
 		last_children = children
 		last_adults = adults
-		
+	
 		# Calculate and display FPS
 		fps_frame_count += 1
 		if fps_frame_count >= 30:
@@ -296,29 +399,57 @@ def main():
 		# Upload to Firebase on status change or every N frames
 		frame_counter += 1
 		if global_status != prev_status or frame_counter >= upload_interval:
-			firebase.update_status(global_status)
+			# Send detailed status with child count and danger info
+			status_data = {
+				"status": global_status,
+				"timestamp": time.time(),
+				"children_count": len(children),
+				"adults_count": len(adults),
+				"children_in_danger": len(children_in_danger)
+			}
+			firebase.update_status(global_status, status_data)
 			prev_status = global_status
 			frame_counter = 0
 
-		# Show global status banner
+		# Show global status banner with flashing effect for danger
 		if global_status == "safe":
 			banner_color = (0, 200, 0)
+			status_text = "✓ SAFE"
 		elif global_status == "warning":
 			banner_color = (0, 255, 255)
+			status_text = "⚠ WARNING"
 		else:
-			banner_color = (0, 0, 255)
-		
+			# Flashing red banner for danger
+			flash_on = (frame_counter % 10) < 5
+			banner_color = (0, 0, 255) if flash_on else (0, 0, 150)
+			status_text = "🚨 DANGER ALERT"
+
 		cv2.rectangle(frame, (0, 0), (w, 40), (0, 0, 0), -1)
 		cv2.putText(
 			frame,
-			global_status.upper(),
+			status_text,
 			(10, 28),
 			cv2.FONT_HERSHEY_SIMPLEX,
 			0.9,
 			banner_color,
 			2,
 		)
-		
+
+		# Show child count in zone
+		if len(children) > 0:
+			child_info = f"Children: {len(children)}"
+			if children_in_danger:
+				child_info += f" | IN DANGER: {len(children_in_danger)}"
+			cv2.putText(
+				frame,
+				child_info,
+				(10, h - 15),
+				cv2.FONT_HERSHEY_SIMPLEX,
+				0.5,
+				(255, 255, 255),
+				1,
+			)
+
 		# Display FPS
 		if fps_display > 0:
 			cv2.putText(
@@ -338,8 +469,8 @@ def main():
 				break
 
 	cap.release()
-	if not args.no_display:
-		cv2.destroyAllWindows()
+	cv2.destroyAllWindows()
+	print("\nSafeEdge Guardian stopped.")
 
 
 if __name__ == "__main__":
